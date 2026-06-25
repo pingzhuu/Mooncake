@@ -3,6 +3,7 @@
 #include <string>
 #include <sys/uio.h>
 #include <unistd.h>
+#include <vector>
 #include <glog/logging.h>
 
 #include "file_interface.h"
@@ -125,27 +126,60 @@ tl::expected<size_t, ErrorCode> PosixFile::vector_write(const iovec *iov,
     size_t total_bytes = 0;
     for (int i = 0; i < iovcnt; ++i) total_bytes += iov[i].iov_len;
 
+    // Mutable copy for partial-write retry: pwritev may return fewer bytes
+    // than requested, and adjusting the iovec base/len for the next attempt
+    // requires modifying the array in place.
+    std::vector<iovec> iovs(iov, iov + iovcnt);
+
     size_t written_total = 0;
     off_t cur_offset = offset;
 
     for (int idx = 0; idx < iovcnt; idx += UIO_MAXIOV) {
         int chunk_cnt = std::min(iovcnt - idx, UIO_MAXIOV);
-        ssize_t ret = ::pwritev(fd_, iov + idx, chunk_cnt, cur_offset);
-        if (ret < 0) {
-            int saved_errno = errno;
-            LOG(ERROR) << "pwritev failed for file: " << filename_
-                       << ", errno=" << saved_errno
-                       << " (" << strerror(saved_errno) << ")"
-                       << ", fd=" << fd_
-                       << ", iovcnt=" << iovcnt
-                       << ", total_bytes=" << total_bytes
-                       << ", offset=" << offset
-                       << ", chunk_start=" << idx
-                       << ", chunk_cnt=" << chunk_cnt;
-            return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+        size_t chunk_remaining = 0;
+        for (int i = 0; i < chunk_cnt; ++i)
+            chunk_remaining += iovs[idx + i].iov_len;
+
+        // pwritev may return fewer bytes than requested (signal interruption,
+        // internal kernel limits). Loop until the entire chunk is written.
+        int chunk_offset = 0;
+        while (chunk_remaining > 0) {
+            ssize_t ret = ::pwritev(fd_, iovs.data() + idx + chunk_offset,
+                                     chunk_cnt - chunk_offset, cur_offset);
+            if (ret < 0) {
+                int saved_errno = errno;
+                LOG(ERROR) << "pwritev failed for file: " << filename_
+                           << ", errno=" << saved_errno
+                           << " (" << strerror(saved_errno) << ")"
+                           << ", fd=" << fd_
+                           << ", iovcnt=" << iovcnt
+                           << ", total_bytes=" << total_bytes
+                           << ", offset=" << offset
+                           << ", chunk_start=" << idx
+                           << ", chunk_cnt=" << chunk_cnt;
+                return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+            }
+            if (ret == 0) {
+                LOG(ERROR) << "pwritev returned 0 for file: " << filename_
+                           << ", would loop forever";
+                return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+            }
+            written_total += ret;
+            cur_offset += ret;
+            chunk_remaining -= ret;
+            // Advance past fully-written iovecs; split partial iovec.
+            while (chunk_offset < chunk_cnt && ret > 0) {
+                if (static_cast<size_t>(ret) >= iovs[idx + chunk_offset].iov_len) {
+                    ret -= iovs[idx + chunk_offset].iov_len;
+                    ++chunk_offset;
+                } else {
+                    iovs[idx + chunk_offset].iov_base =
+                        static_cast<char*>(iovs[idx + chunk_offset].iov_base) + ret;
+                    iovs[idx + chunk_offset].iov_len -= ret;
+                    ret = 0;
+                }
+            }
         }
-        written_total += ret;
-        cur_offset += ret;
     }
 
     if (written_total != total_bytes) {
@@ -168,29 +202,53 @@ tl::expected<size_t, ErrorCode> PosixFile::vector_read(const iovec *iov,
     size_t total_bytes = 0;
     for (int i = 0; i < iovcnt; ++i) total_bytes += iov[i].iov_len;
 
+    // Mutable copy for partial-read retry (see vector_write for rationale).
+    std::vector<iovec> iovs(iov, iov + iovcnt);
+
     size_t read_total = 0;
     off_t cur_offset = offset;
 
     for (int idx = 0; idx < iovcnt; idx += UIO_MAXIOV) {
         int chunk_cnt = std::min(iovcnt - idx, UIO_MAXIOV);
-        ssize_t ret = ::preadv(fd_, iov + idx, chunk_cnt, cur_offset);
-        if (ret < 0) {
-            int saved_errno = errno;
-            LOG(ERROR) << "preadv failed for file: " << filename_
-                       << ", errno=" << saved_errno
-                       << " (" << strerror(saved_errno) << ")"
-                       << ", fd=" << fd_
-                       << ", iovcnt=" << iovcnt
-                       << ", total_bytes=" << total_bytes
-                       << ", offset=" << offset
-                       << ", chunk_start=" << idx
-                       << ", chunk_cnt=" << chunk_cnt;
-            return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
+        size_t chunk_remaining = 0;
+        for (int i = 0; i < chunk_cnt; ++i)
+            chunk_remaining += iovs[idx + i].iov_len;
+
+        int chunk_offset = 0;
+        while (chunk_remaining > 0) {
+            ssize_t ret = ::preadv(fd_, iovs.data() + idx + chunk_offset,
+                                   chunk_cnt - chunk_offset, cur_offset);
+            if (ret < 0) {
+                int saved_errno = errno;
+                LOG(ERROR) << "preadv failed for file: " << filename_
+                           << ", errno=" << saved_errno
+                           << " (" << strerror(saved_errno) << ")"
+                           << ", fd=" << fd_
+                           << ", iovcnt=" << iovcnt
+                           << ", total_bytes=" << total_bytes
+                           << ", offset=" << offset
+                           << ", chunk_start=" << idx
+                           << ", chunk_cnt=" << chunk_cnt;
+                return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
+            }
+            if (ret == 0) goto done;  // EOF
+            read_total += ret;
+            cur_offset += ret;
+            chunk_remaining -= ret;
+            while (chunk_offset < chunk_cnt && ret > 0) {
+                if (static_cast<size_t>(ret) >= iovs[idx + chunk_offset].iov_len) {
+                    ret -= iovs[idx + chunk_offset].iov_len;
+                    ++chunk_offset;
+                } else {
+                    iovs[idx + chunk_offset].iov_base =
+                        static_cast<char*>(iovs[idx + chunk_offset].iov_base) + ret;
+                    iovs[idx + chunk_offset].iov_len -= ret;
+                    ret = 0;
+                }
+            }
         }
-        read_total += ret;
-        cur_offset += ret;
-        if (ret == 0) break;  // EOF
     }
+done:
 
     return read_total;
 }
