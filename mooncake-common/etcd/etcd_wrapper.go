@@ -97,7 +97,7 @@ func newStoreClientConfig(validEndpoints []string) clientv3.Config {
 		DialTimeout:          5 * time.Second,
 		DialKeepAliveTime:    storeDialKeepAliveTime,
 		DialKeepAliveTimeout: storeDialKeepAliveTimeout,
-		PermitWithoutStream:  true,
+		PermitWithoutStream:  false,
 	}
 }
 
