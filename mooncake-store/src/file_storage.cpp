@@ -592,8 +592,14 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             LOG(ERROR) << "Failed to store objects with error: "
                        << offload_res.error();
             if (offload_res.error() == ErrorCode::KEYS_ULTRA_LIMIT) {
-                MutexLocker locker(&offloading_mutex_);
-                enable_offloading_ = false;
+                // Throttle this batch but do NOT permanently disable
+                // offloading. The next heartbeat will re-query master and
+                // retry. Previously this set enable_offloading_=false with no
+                // recovery path, permanently breaking SSD offload after a
+                // single transient KEYS_ULTRA_LIMIT.
+                LOG(WARNING) << "KEYS_ULTRA_LIMIT from BatchOffload, "
+                             << "skipping batch this cycle "
+                             << "(offloading will retry next heartbeat)";
                 return tl::make_unexpected(offload_res.error());
             }
             if (offload_res.error() != ErrorCode::INVALID_READ) {
