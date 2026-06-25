@@ -237,6 +237,14 @@ struct FileStorageConfig {
     // Use io_uring for file I/O instead of POSIX pread/pwrite
     bool use_uring = false;
 
+    // Number of worker threads that parallelize per-bucket WriteBucket calls
+    // during SSD offload. Each bucket is an independent file, so concurrent
+    // writes overlap on disk IO. Set to 1 (or 0) to use the legacy single-
+    // threaded serial loop. Metadata/eviction critical sections inside
+    // BatchOffload are guarded by storage_backend_'s mutex_, so parallel
+    // dispatch is safe.
+    uint32_t offload_write_threads = 4;
+
     // Validates the configuration for correctness and consistency
     bool Validate() const;
 

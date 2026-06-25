@@ -2,6 +2,7 @@
 
 #include <condition_variable>
 #include <deque>
+#include <future>
 #include <mutex>
 
 #include "client_service.h"
@@ -179,6 +180,19 @@ class FileStorage {
     std::deque<PromotionTaskItem> promotion_task_queue_;
     std::future<void> rescan_future_;
     std::atomic<bool> metadata_resync_pending_{false};
+
+    // Offload write thread pool — parallelizes per-bucket WriteBucket calls
+    // (each bucket is an independent file, can be written concurrently).
+    // The metadata/eviction critical sections inside BatchOffload are already
+    // guarded by storage_backend_'s mutex_, so parallel writes only overlap
+    // on the actual disk IO segment, which is the bottleneck we want to scale.
+    std::atomic<bool> offload_write_workers_running_{false};
+    std::vector<std::thread> offload_write_threads_;
+    std::mutex offload_write_queue_mutex_;
+    std::condition_variable offload_write_queue_cv_;
+    std::deque<std::packaged_task<tl::expected<void, ErrorCode>()>>
+        offload_write_queue_;
+    size_t offload_write_thread_count_{4};
 };
 
 }  // namespace mooncake
