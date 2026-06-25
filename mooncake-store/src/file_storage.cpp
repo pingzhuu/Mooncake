@@ -102,6 +102,10 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
                        GetEnvStringOr("MOONCAKE_USE_URING", "false"));
     config.use_uring = (use_uring_str == "true" || use_uring_str == "1");
 
+    config.offload_write_threads =
+        GetEnvOr<uint32_t>("MOONCAKE_OFFLOAD_WRITE_THREADS",
+                           config.offload_write_threads);
+
     return config;
 }
 
@@ -259,6 +263,15 @@ FileStorage::~FileStorage() {
     for (const auto& task : queued_tasks_to_release) {
         ReleasePromotionTask(task.key, task.tenant_id);
     }
+
+    // Stop the offload write pool. Drain remaining tasks before workers exit.
+    offload_write_workers_running_.store(false);
+    offload_write_queue_cv_.notify_all();
+    for (auto& worker : offload_write_threads_) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
 }
 
 tl::expected<void, ErrorCode> FileStorage::Init() {
@@ -340,6 +353,41 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
             promotion_worker_threads_.emplace_back(
                 &FileStorage::PromotionWorkerThreadFunc, this);
         }
+    }
+
+    // Start the offload write thread pool. Each worker pulls a packaged_task
+    // (one bucket's worth of WriteBucket work) from offload_write_queue_ and
+    // runs it. Pool size 1 -> falls back to serial path inside OffloadObjects.
+    offload_write_thread_count_ = config_.offload_write_threads;
+    if (offload_write_thread_count_ > 1) {
+        offload_write_workers_running_.store(true);
+        offload_write_threads_.reserve(offload_write_thread_count_);
+        for (size_t i = 0; i < offload_write_thread_count_; ++i) {
+            offload_write_threads_.emplace_back([this]() {
+                while (offload_write_workers_running_.load() ||
+                       !offload_write_queue_.empty()) {
+                    std::packaged_task<tl::expected<void, ErrorCode>()> task;
+                    {
+                        std::unique_lock<std::mutex> lk(
+                            offload_write_queue_mutex_);
+                        offload_write_queue_cv_.wait(lk, [this] {
+                            return !offload_write_queue_.empty() ||
+                                   !offload_write_workers_running_.load();
+                        });
+                        if (!offload_write_workers_running_.load() &&
+                            offload_write_queue_.empty()) {
+                            return;
+                        }
+                        task = std::move(offload_write_queue_.front());
+                        offload_write_queue_.pop_front();
+                    }
+                    task();
+                }
+            });
+        }
+        LOG(INFO) << "[OffloadWritePool] started "
+                  << offload_write_thread_count_
+                  << " workers for parallel WriteBucket";
     }
     heartbeat_running_.store(true);
     heartbeat_thread_ = std::thread([this]() {
@@ -461,7 +509,10 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         return ErrorCode::OK;
     };
 
-    for (const auto& keys : buckets_keys) {
+    auto process_bucket =
+        [this, &task_by_storage_key, &complete_handler](
+            const std::vector<std::string>& keys)
+        -> tl::expected<void, ErrorCode> {
         std::unordered_map<std::string, std::vector<Slice>> batch_object;
         std::unordered_map<std::string, std::vector<std::string>>
             storage_keys_by_tenant;
@@ -496,7 +547,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
         }
         if (batch_object.empty()) {
-            continue;
+            return {};
         }
 
         auto eviction_handler = [this](const std::vector<std::string>&
@@ -604,6 +655,49 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
             if (offload_res.error() != ErrorCode::INVALID_READ) {
                 return tl::make_unexpected(offload_res.error());
+            }
+        }
+        return {};
+    };
+
+    // Parallelize per-bucket WriteBucket by dispatching to a thread pool.
+    // Each bucket is an independent file, so writes can overlap on disk IO.
+    // Metadata critical sections inside BatchOffload are guarded by
+    // storage_backend_'s mutex_, so concurrent dispatch is safe -- workers
+    // serialize on the lock but overlap on the actual pwritev/uring submit.
+    const bool use_pool = offload_write_thread_count_ > 1 &&
+                          offload_write_workers_running_.load() &&
+                          buckets_keys.size() > 1;
+    if (use_pool) {
+        std::vector<std::future<tl::expected<void, ErrorCode>>> futures;
+        futures.reserve(buckets_keys.size());
+        for (const auto& keys : buckets_keys) {
+            std::packaged_task<tl::expected<void, ErrorCode>()> task(
+                [&, keys = keys]() { return process_bucket(keys); });
+            futures.push_back(task.get_future());
+            {
+                std::lock_guard<std::mutex> lk(offload_write_queue_mutex_);
+                offload_write_queue_.emplace_back(std::move(task));
+            }
+            offload_write_queue_cv_.notify_one();
+        }
+        // Wait for all buckets to finish. First error is returned but we
+        // still wait for all futures to avoid orphaned in-flight tasks.
+        tl::expected<void, ErrorCode> first_error;
+        for (auto& fut : futures) {
+            auto res = fut.get();
+            if (!res && first_error.has_value()) {
+                first_error = tl::make_unexpected(res.error());
+            }
+        }
+        if (!first_error) {
+            return tl::make_unexpected(first_error.error());
+        }
+    } else {
+        for (const auto& keys : buckets_keys) {
+            auto res = process_bucket(keys);
+            if (!res) {
+                return tl::make_unexpected(res.error());
             }
         }
     }
