@@ -80,6 +80,9 @@ struct TransferHandshakeUtil {
 #ifdef USE_EFA
         root["efa_addr"] = desc.efa_addr;  // EFA endpoint address
 #endif
+#ifdef USE_CXI
+        root["cxi_addr"] = desc.cxi_addr;
+#endif
 
 #ifdef USE_UB
         Json::Value jettyNums(Json::arrayValue);
@@ -113,6 +116,10 @@ struct TransferHandshakeUtil {
         desc.reply_msg = root["reply_msg"].asString();
 #ifdef USE_EFA
         desc.efa_addr = root["efa_addr"].asString();  // EFA endpoint address
+#endif
+
+#ifdef USE_CXI
+        desc.cxi_addr = root["cxi_addr"].asString();
 #endif
 
 #ifdef USE_UB
@@ -324,7 +331,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
 
     if (segmentJSON["protocol"] == "rdma" ||
         segmentJSON["protocol"] == "barex" ||
-        segmentJSON["protocol"] == "efa") {
+        segmentJSON["protocol"] == "efa" || segmentJSON["protocol"] == "cxi") {
         Json::Value devicesJSON(Json::arrayValue);
         for (const auto &device : desc.devices) {
             Json::Value deviceJSON;
@@ -668,7 +675,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
         desc->rdma_server_name = segmentJSON["rdma_server_name"].asString();
 
     if (desc->protocol == "rdma" || desc->protocol == "barex" ||
-        desc->protocol == "efa") {
+        desc->protocol == "efa" || desc->protocol == "cxi") {
         for (const auto &deviceJSON : segmentJSON["devices"]) {
             DeviceDesc device;
             device.name = deviceJSON["name"].asString();
@@ -1198,10 +1205,9 @@ int TransferMetadata::rePublishRpcMetaEntry(const std::string &server_name) {
 
     Json::Value existing;
     if (storage_plugin_->get(full_key, existing)) {
-        Json::Value desired;
-        desired["ip_or_host_name"] = local_rpc_meta_.ip_or_host_name;
-        desired["rpc_port"] = static_cast<Json::UInt>(local_rpc_meta_.rpc_port);
-        if (existing == desired) {
+        if (existing["ip_or_host_name"].asString() ==
+                local_rpc_meta_.ip_or_host_name &&
+            existing["rpc_port"].asUInt() == local_rpc_meta_.rpc_port) {
             return 0;
         }
     }

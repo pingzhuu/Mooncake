@@ -13,8 +13,19 @@
 namespace mooncake {
 
 WrappedMasterService::WrappedMasterService(
-    const WrappedMasterServiceConfig& config)
-    : master_service_(MasterServiceConfig(config)) {}
+    const WrappedMasterServiceConfig& config,
+    HttpMetadataServer* http_metadata_server,
+    const std::string& http_metadata_remote_url)
+    : master_service_(MasterServiceConfig(config)) {
+    // Configure metadata cleanup on client timeout. Prefer the co-located
+    // in-process server; otherwise fall back to a separately-deployed HTTP
+    // metadata server derived from the cluster configuration.
+    if (http_metadata_server) {
+        master_service_.setHttpMetadataServer(http_metadata_server);
+    } else if (!http_metadata_remote_url.empty()) {
+        master_service_.setHttpMetadataRemoteUrl(http_metadata_remote_url);
+    }
+}
 
 WrappedMasterService::~WrappedMasterService() = default;
 
@@ -1089,28 +1100,7 @@ WrappedMasterService::DeleteTenantQuotaPolicy(const std::string& tenant_id) {
     if (!master_service_.IsTenantQuotaEnabled()) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
-    auto before = master_service_.GetTenantQuotaSnapshot(tenant_id);
-    if (!before.has_value()) {
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
     return master_service_.DeleteTenantQuotaPolicy(tenant_id);
-}
-
-tl::expected<uint64_t, ErrorCode>
-WrappedMasterService::GetDefaultTenantQuotaPolicy() {
-    if (!master_service_.IsTenantQuotaEnabled()) {
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
-    }
-    return master_service_.GetDefaultTenantQuotaPolicy();
-}
-
-tl::expected<void, ErrorCode> WrappedMasterService::SetDefaultTenantQuotaPolicy(
-    uint64_t requested_quota_bytes) {
-    if (!master_service_.IsTenantQuotaEnabled()) {
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
-    }
-    master_service_.SetDefaultTenantQuotaPolicy(requested_quota_bytes);
-    return {};
 }
 
 tl::expected<uint64_t, ErrorCode>
