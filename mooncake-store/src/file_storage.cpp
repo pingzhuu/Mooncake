@@ -416,10 +416,11 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     }
 
     std::vector<std::vector<std::string>> buckets_keys;
+    std::vector<std::string> skipped_keys;
     if (auto bucket_backend =
             std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_)) {
         auto allocate_res = bucket_backend->AllocateOffloadingBuckets(
-            storage_object_sizes, buckets_keys);
+            storage_object_sizes, buckets_keys, skipped_keys);
         if (!allocate_res) {
             LOG(ERROR) << "AllocateOffloadingBuckets failed with error: "
                        << allocate_res.error();
@@ -615,6 +616,46 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
         }
     }
+
+    if (!skipped_keys.empty()) {
+        LOG(INFO) << "[OFFLOAD-SKIP] " << skipped_keys.size()
+                  << " keys already exist on SSD, re-reporting to master";
+        std::vector<StorageObjectMetadata> skipped_metadatas;
+        if (auto bucket_backend =
+                std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_)) {
+            std::unordered_map<std::string, StorageObjectMetadata>
+                existing_metadata_map;
+            auto query_result =
+                bucket_backend->BatchQuery(skipped_keys, existing_metadata_map);
+            if (!query_result) {
+                LOG(ERROR) << "[OFFLOAD-SKIP] BatchQuery for skipped keys "
+                           << "failed: " << query_result.error();
+            } else {
+                skipped_metadatas.reserve(skipped_keys.size());
+                for (const auto& key : skipped_keys) {
+                    auto it = existing_metadata_map.find(key);
+                    if (it != existing_metadata_map.end()) {
+                        skipped_metadatas.push_back(it->second);
+                    } else {
+                        LOG(ERROR) << "[OFFLOAD-SKIP] Key not found in "
+                                   << "BatchQuery: " << key;
+                    }
+                }
+                if (!skipped_metadatas.empty()) {
+                    auto skip_result =
+                        complete_handler(skipped_keys, skipped_metadatas);
+                    if (skip_result != ErrorCode::OK) {
+                        LOG(WARNING) << "[OFFLOAD-SKIP] complete_handler "
+                                     << "returned "
+                                     << static_cast<int>(skip_result)
+                                     << " for " << skipped_keys.size()
+                                     << " skipped keys";
+                    }
+                }
+            }
+        }
+    }
+
     return {};
 }
 

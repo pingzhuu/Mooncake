@@ -793,7 +793,8 @@ class BucketStorageBackend : public StorageBackendInterface {
      */
     tl::expected<void, ErrorCode> AllocateOffloadingBuckets(
         const std::unordered_map<std::string, int64_t>& offloading_objects,
-        std::vector<std::vector<std::string>>& buckets_keys);
+        std::vector<std::vector<std::string>>& buckets_keys,
+        std::vector<std::string>& skipped_keys);
 
     void ClearUngroupedOffloadingObjects();
 
@@ -872,7 +873,8 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     tl::expected<void, ErrorCode> GroupOffloadingKeysByBucket(
         const std::unordered_map<std::string, int64_t>& offloading_objects,
-        std::vector<std::vector<std::string>>& buckets_keys);
+        std::vector<std::vector<std::string>>& buckets_keys,
+        std::vector<std::string>& skipped_keys);
 
     tl::expected<void, ErrorCode> HandleNext(
         const std::function<

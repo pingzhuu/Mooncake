@@ -1847,8 +1847,10 @@ BucketStorageBackend::GetStoreMetadata() {
 
 tl::expected<void, ErrorCode> BucketStorageBackend::AllocateOffloadingBuckets(
     const std::unordered_map<std::string, int64_t>& offloading_objects,
-    std::vector<std::vector<std::string>>& buckets_keys) {
-    return GroupOffloadingKeysByBucket(offloading_objects, buckets_keys);
+    std::vector<std::vector<std::string>>& buckets_keys,
+    std::vector<std::string>& skipped_keys) {
+    return GroupOffloadingKeysByBucket(offloading_objects, buckets_keys,
+                                        skipped_keys);
 }
 
 void BucketStorageBackend::ClearUngroupedOffloadingObjects() {
@@ -1863,7 +1865,8 @@ size_t BucketStorageBackend::UngroupedOffloadingObjectsSize() const {
 
 tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
     const std::unordered_map<std::string, int64_t>& offloading_objects,
-    std::vector<std::vector<std::string>>& buckets_keys) {
+    std::vector<std::vector<std::string>>& buckets_keys,
+    std::vector<std::string>& skipped_keys) {
     MutexLocker offloading_locker(&offloading_mutex_);
     auto& ungrouped_offloading_objects = ungrouped_offloading_objects_;
     auto it = offloading_objects.cbegin();
@@ -1922,6 +1925,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
                            << ", error=" << is_exist_result.error();
             }
             if (is_exist_result && is_exist_result.value()) {
+                skipped_keys.push_back(it->first);
                 ++it;
                 continue;
             }
@@ -1949,6 +1953,13 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
                 << ", current bucket data size: " << bucket_data_size
                 << ", grouped bucket count: " << buckets_keys.size()
                 << ", residue object count: " << residue_count;
+    }
+
+    if (!skipped_keys.empty()) {
+        LOG(INFO) << "[OFFLOAD-GROUP] skipped=" << skipped_keys.size()
+                  << " (already exist on SSD), grouped="
+                  << offloading_objects.size() - skipped_keys.size()
+                  << ", buckets=" << buckets_keys.size();
     }
 
     return {};

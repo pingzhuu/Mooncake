@@ -81,8 +81,10 @@ class FileStorageTest : public ::testing::Test {
         if (!bucket_backend) {
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
+        std::vector<std::string> skipped_keys;
         return bucket_backend->AllocateOffloadingBuckets(offloading_objects,
-                                                         buckets_keys);
+                                                         buckets_keys,
+                                                         skipped_keys);
     }
 
     size_t GetUngroupedOffloadingObjectsSize(FileStorage& fileStorage) {
