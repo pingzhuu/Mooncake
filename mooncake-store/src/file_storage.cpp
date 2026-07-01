@@ -583,6 +583,20 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         };
         auto offload_res = storage_backend_->BatchOffload(
             host_batch_object, bucket_complete_handler, eviction_handler);
+        auto bucket_elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - offload_start).count();
+        int64_t bucket_bytes = 0;
+        for (const auto& [k, slices] : host_batch_object) {
+            for (const auto& s : slices) bucket_bytes += s.size;
+        }
+        LOG(INFO) << "[OFFLOAD-BUCKET] keys=" << host_batch_object.size()
+                  << " bytes=" << bucket_bytes
+                  << " elapsed_ms=" << bucket_elapsed_ms
+                  << " (throughput="
+                  << (bucket_elapsed_ms > 0 ? (bucket_bytes/1024/1024)*1000/bucket_elapsed_ms : 0)
+                  << " MB/s)"
+                  << " result=" << (offload_res ? "OK" : "FAIL");
 
         // Release staging buffers back to pool (Buffer is POD, no destructor)
         for (auto& buf : staging_bufs) {
@@ -718,7 +732,21 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     if (!offloading_objects.empty()) {
         // === STEP 2: Persist offloaded objects (trigger actual data
         // migration) ===
+        int64_t fetched_bytes = 0;
+        for (const auto& t : offloading_objects) fetched_bytes += t.size;
+        auto t0 = std::chrono::steady_clock::now();
+        LOG(INFO) << "[OFFLOAD-FETCH] got " << offloading_objects.size()
+                  << " tasks, total_bytes=" << fetched_bytes
+                  << " (avg=" << (fetched_bytes / offloading_objects.size())
+                  << ") from master";
         auto offload_result = OffloadObjects(offloading_objects);
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        LOG(INFO) << "[OFFLOAD-FETCH] processed " << offloading_objects.size()
+                  << " tasks in " << elapsed_ms << "ms"
+                  << " (throughput="
+                  << (elapsed_ms > 0 ? (fetched_bytes / 1024 / 1024) * 1000 / elapsed_ms : 0)
+                  << " MB/s)";
         if (!offload_result) {
             LOG(ERROR) << "Failed to persist objects with error: "
                        << offload_result.error();

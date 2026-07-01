@@ -4115,11 +4115,28 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
             std::vector<OffloadTaskItem> result;
             result.reserve(
                 local_disk_segment_it->second->offloading_objects.size());
+            int64_t total_bytes = 0;
+            int64_t min_size = INT64_MAX;
+            int64_t max_size = 0;
             for (const auto& [_, task] :
                  local_disk_segment_it->second->offloading_objects) {
                 result.push_back(task);
+                total_bytes += task.size;
+                if (task.size < min_size) min_size = task.size;
+                if (task.size > max_size) max_size = task.size;
             }
+            size_t queue_size_before = local_disk_segment_it->second->offloading_objects.size();
             local_disk_segment_it->second->offloading_objects.clear();
+            if (!result.empty()) {
+                LOG(INFO) << "[OFFLOAD-DISPATCH] client=" << client_id
+                          << " fetched=" << result.size()
+                          << " total_bytes=" << total_bytes
+                          << " (avg=" << (total_bytes / result.size())
+                          << " min=" << min_size
+                          << " max=" << max_size << ")"
+                          << " queue_size_after_dispatch=0"
+                          << " (was=" << queue_size_before << ")";
+            }
             return result;
         }
         // Offloading is disabled: clear the pending queue to prevent
@@ -4197,6 +4214,11 @@ auto MasterService::NotifyOffloadSuccess(
     if (tasks.size() != metadatas.size()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    auto now = std::chrono::system_clock::now();
+    int64_t total_bytes = 0;
+    int64_t max_age_ms = 0;
+    int64_t sum_age_ms = 0;
+    size_t completed_count = 0;
     for (size_t i = 0; i < tasks.size(); ++i) {
         const auto& task = tasks[i];
         const auto& metadata = metadatas[i];
@@ -4211,6 +4233,12 @@ auto MasterService::NotifyOffloadSuccess(
                 auto task_it =
                     tenant_state.offloading_tasks.find(object_id.user_key);
                 if (task_it != tenant_state.offloading_tasks.end()) {
+                    auto age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now - task_it->second.start_time).count();
+                    sum_age_ms += age_ms;
+                    if (age_ms > max_age_ms) max_age_ms = age_ms;
+                    total_bytes += task.size;
+                    completed_count++;
                     auto source =
                         obj_metadata.GetReplicaByID(task_it->second.source_id);
                     if (source != nullptr) {
@@ -4233,6 +4261,15 @@ auto MasterService::NotifyOffloadSuccess(
                        << ", key=" << object_id.user_key;
             return tl::make_unexpected(res.error());
         }
+    }
+    if (completed_count > 0) {
+        LOG(INFO) << "[OFFLOAD-COMPLETE] client=" << client_id
+                  << " completed=" << completed_count
+                  << "/" << tasks.size()
+                  << " total_bytes=" << total_bytes
+                  << " (avg=" << (total_bytes / completed_count) << ")"
+                  << " age_ms avg=" << (sum_age_ms / completed_count)
+                  << " max=" << max_age_ms;
     }
     return {};
 }
@@ -4878,6 +4915,9 @@ void MasterService::DiscardExpiredProcessingReplicas(
             task_it = tenant_state.replication_tasks.erase(task_it);
         }
 
+        int64_t expired_count = 0;
+        int64_t expired_sum_age_ms = 0;
+        int64_t expired_max_age_ms = 0;
         for (auto task_it = tenant_state.offloading_tasks.begin();
              task_it != tenant_state.offloading_tasks.end();) {
             const auto ttl =
@@ -4886,6 +4926,10 @@ void MasterService::DiscardExpiredProcessingReplicas(
                 task_it++;
                 continue;
             }
+            auto age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - task_it->second.start_time).count();
+            expired_sum_age_ms += age_ms;
+            if (age_ms > expired_max_age_ms) expired_max_age_ms = age_ms;
             auto metadata_it = tenant_state.metadata.find(task_it->first);
             if (metadata_it != tenant_state.metadata.end()) {
                 auto source = metadata_it->second.GetReplicaByID(
@@ -4894,9 +4938,19 @@ void MasterService::DiscardExpiredProcessingReplicas(
                     source->dec_refcnt();
                 }
             }
-            LOG(WARNING) << "Offloading task expired for key: "
-                         << task_it->first;
+            VLOG(1) << "Offloading task expired for key: "
+                    << task_it->first;
             task_it = tenant_state.offloading_tasks.erase(task_it);
+            expired_count++;
+        }
+        if (expired_count > 0) {
+            LOG(WARNING) << "[OFFLOAD-EXPIRED] tenant=" << tenant_it->first
+                         << " count=" << expired_count
+                         << " age_ms avg=" << (expired_sum_age_ms / expired_count)
+                         << " max=" << expired_max_age_ms
+                         << " (TTL=" << put_start_release_timeout_sec_.count()
+                         << "s, backlog_remaining="
+                         << tenant_state.offloading_tasks.size() << ")";
         }
 
         for (auto task_it = tenant_state.promotion_tasks.begin();
@@ -6815,12 +6869,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
         MasterMetricManager::instance().inc_eviction_fail();
         MasterMetricManager::instance().inc_mem_eviction_fail();
     }
-    VLOG(1) << "action=evict_objects"
-            << ", evicted_count=" << evicted_count
-            << ", offload_deferred=" << offload_deferred_count
-            << ", offload_cap_forced=" << offload_cap_forced_count
-            << ", offload_push_failed_forced=" << offload_push_failed_forced
-            << ", total_freed_size=" << total_freed_size;
+    LOG(INFO) << "[BATCHEVICT] target_ratio=" << evict_ratio_target
+              << " object_count=" << object_count
+              << " evicted=" << evicted_count
+              << " offload_deferred=" << offload_deferred_count
+              << " offload_cap=" << offload_cap
+              << " offload_cap_forced=" << offload_cap_forced_count
+              << " offload_push_failed_forced=" << offload_push_failed_forced
+              << " total_freed_bytes=" << total_freed_size;
     if (offload_on_evict_ && evicted_count == 0 && offload_deferred_count > 0) {
         LOG(WARNING) << "[EVICT] No memory freed this cycle; "
                      << offload_deferred_count
