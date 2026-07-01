@@ -1899,6 +1899,17 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
         for (int64_t i = static_cast<int64_t>(bucket_keys.size());
              i < bucket_backend_config_.bucket_keys_limit; ++i) {
             if (it == offloading_objects.cend()) {
+                if (!bucket_keys.empty()) {
+                    auto bucket_keys_count =
+                        static_cast<int64_t>(bucket_keys.size());
+                    residue_count -= bucket_keys_count;
+                    buckets_keys.push_back(std::move(bucket_keys));
+                    LOG(INFO) << "[OFFLOAD-PARTIAL] writing partial bucket with "
+                              << bucket_keys_count
+                              << " keys (< limit "
+                              << bucket_backend_config_.bucket_keys_limit
+                              << ") to avoid ungrouped backlog";
+                }
                 for (const auto& bucket_object : bucket_objects) {
                     ungrouped_offloading_objects.emplace(bucket_object.first,
                                                          bucket_object.second);
