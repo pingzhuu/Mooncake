@@ -6475,23 +6475,28 @@ void MasterService::BatchEvict(double evict_ratio_target,
         [&, this](
             const std::string& tenant_id, const std::string& key,
             ObjectMetadata& metadata, TenantState& tenant_state,
-            std::vector<std::vector<Replica>>& deferred_replicas) -> uint64_t {
+            std::vector<std::vector<Replica>>& deferred_replicas)
+        -> std::pair<uint64_t, bool> {
         if (!offload_on_evict_) {
             // Original behavior
-            return evict_replicas(metadata, deferred_replicas);
+            return std::pair<uint64_t, bool>{evict_replicas(metadata, deferred_replicas), true};
         }
 
         // LOCAL_DISK replica already exists — safe to delete MEMORY immediately
         if (has_local_disk_replica(metadata)) {
-            return evict_replicas(metadata, deferred_replicas);
+            return std::pair<uint64_t, bool>{evict_replicas(metadata, deferred_replicas), true};
         }
 
-        // Force-evict cap: if force_evict enabled and cap reached, force
-        // delete. Warning is aggregated at the end of the cycle to avoid log
-        // flooding.
-        if (offload_force_evict_ && offload_queued_this_cycle >= offload_cap) {
-            offload_cap_forced_count++;
-            return evict_replicas(metadata, deferred_replicas);
+        // Per-cycle offload cap: stop pushing new offload tasks once the cap
+        // is reached (whether or not force_evict is enabled). Keys beyond the
+        // cap are skipped (return without freeing or queuing); they will be
+        // reconsidered in the next BatchEvict cycle.
+        if (offload_queued_this_cycle >= offload_cap) {
+            if (offload_force_evict_) {
+                offload_cap_forced_count++;
+                return std::pair<uint64_t, bool>{evict_replicas(metadata, deferred_replicas), true};
+            }
+            return std::pair<uint64_t, bool>{0, false};
         }
 
         // Queue one MEMORY replica for offload; others will be evicted below.
@@ -6520,7 +6525,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
             // Any remaining MEMORY replicas with refcnt==0 are redundant copies
             // (data survives via the pinned replica → disk). Evict them now to
             // reclaim memory immediately rather than waiting another cycle.
-            return evict_replicas(metadata, deferred_replicas);
+            return std::pair<uint64_t, bool>{evict_replicas(metadata, deferred_replicas), true};
         }
 
         // PushOffloadingQueue failed. Default (data-preserving) behavior is to
@@ -6529,9 +6534,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // prevent silent data loss when the queue is unavailable.
         if (offload_force_evict_) {
             offload_push_failed_forced++;
-            return evict_replicas(metadata, deferred_replicas);
+            return std::pair<uint64_t, bool>{evict_replicas(metadata, deferred_replicas), true};
         }
-        return 0;
+        return std::pair<uint64_t, bool>{0, false};
     };
 
     struct EvictionResult {
@@ -6546,16 +6551,16 @@ void MasterService::BatchEvict(double evict_ratio_target,
                   std::vector<std::vector<Replica>>& deferred_replicas,
                   bool allow_soft_pinned) -> EvictionResult {
         if (!metadata.IsGrouped()) {
-            uint64_t freed = try_evict_or_offload(
+            auto [freed, progress] = try_evict_or_offload(
                 tenant_id, key, metadata, tenant_state, deferred_replicas);
-            return {.freed_bytes = freed, .evicted_objects = freed > 0 ? 1 : 0};
+            return {.freed_bytes = freed, .evicted_objects = progress ? 1 : 0};
         }
 
         auto group_it = tenant_state.group_members.find(metadata.group_id);
         if (group_it == tenant_state.group_members.end()) {
-            uint64_t freed = try_evict_or_offload(
+            auto [freed, progress] = try_evict_or_offload(
                 tenant_id, key, metadata, tenant_state, deferred_replicas);
-            return {.freed_bytes = freed, .evicted_objects = freed > 0 ? 1 : 0};
+            return {.freed_bytes = freed, .evicted_objects = progress ? 1 : 0};
         }
 
         for (const auto& member_key : group_it->second) {
@@ -6582,11 +6587,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 continue;
             }
 
-            uint64_t freed =
+            auto [freed, progress] =
                 try_evict_or_offload(tenant_id, member_key, member_metadata,
                                      tenant_state, deferred_replicas);
             result.freed_bytes += freed;
-            if (freed > 0) {
+            if (progress) {
                 result.evicted_objects++;
             }
             if (member_key != key && !member_metadata.IsValid()) {
@@ -6696,6 +6701,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
         deferred_replicas.clear();
     }
+    LOG(INFO) << "[BATCHEVICT-FIRST] evicted_count=" << evicted_count
+              << " object_count=" << object_count
+              << " target_ratio=" << evict_ratio_target;
 
     // Try releasing discarded replicas before we decide whether to do the
     // second pass.
@@ -6771,6 +6779,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 }
                 deferred_replicas.clear();
             }
+            LOG(INFO) << "[BATCHEVICT-SECONDA] target_evict_num=" << target_evict_num
+                      << " evicted_count=" << evicted_count
+                      << " processed=" << (long)(no_pin_objects.size())
+                      << " (after second pass A)";
         } else if (!soft_pin_objects.empty()) {
             // allow_evict_soft_pinned_objects_ is implicitly true if
             // soft_pin_objects is not empty Second pass B: Prioritize evicting
