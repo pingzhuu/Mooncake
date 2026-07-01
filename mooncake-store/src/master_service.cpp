@@ -2667,6 +2667,28 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         return {};
     }
 
+    // Replace any stale LOCAL_DISK replicas (owned by a different client_id,
+    // e.g., from a previous store-server instance that has since restarted).
+    // This ensures ScanMeta recovery immediately registers the new replica
+    // without waiting for ClearInvalidHandles to clean up the old one.
+    EraseReplicasWithCacheTotalAccounting(
+        metadata, [&client_id](const Replica& rep) {
+            return rep.type() == ReplicaType::LOCAL_DISK &&
+                   rep.get_descriptor()
+                           .get_local_disk_descriptor()
+                           .client_id != client_id;
+        });
+
+    // If we erased the old LOCAL_DISK replica and none matching client_id
+    // remains, add the new one.
+    if (!metadata.HasReplica(&Replica::fn_is_local_disk_replica)) {
+        std::vector<Replica> replicas;
+        replicas.emplace_back(std::move(replica));
+        metadata.AddReplicas(std::move(replicas));
+        return {};
+    }
+
+    // A LOCAL_DISK replica from the same client already exists — update it.
     metadata.VisitReplicas(
         [client_id](const Replica& rep) {
             return rep.type() == ReplicaType::LOCAL_DISK &&
@@ -4225,9 +4247,11 @@ auto MasterService::NotifyOffloadSuccess(
         const auto object_id = MakeObjectIdentity(task.key, task.tenant_id);
 
         // Release refcnt and clear offloading task.
+        bool metadata_existed = false;
         {
             MetadataAccessorRW accessor(this, object_id);
             if (accessor.Exists()) {
+                metadata_existed = true;
                 auto& obj_metadata = accessor.Get();
                 auto& tenant_state = accessor.GetTenantState();
                 auto task_it =
@@ -4246,16 +4270,30 @@ auto MasterService::NotifyOffloadSuccess(
                     }
                     tenant_state.offloading_tasks.erase(task_it);
                 } else {
-                    LOG(WARNING) << "[OFFLOAD-NOTASK] key exists but no "
-                                 << "offloading_task, key=" << object_id.user_key
-                                 << " tenant=" << object_id.tenant_id;
+                    // key exists with no offloading task. This happens during
+                    // ScanMeta recovery: store-server reports a key that was
+                    // already offloaded in a previous session. AddReplica below
+                    // will update/replace the LOCAL_DISK replica.
                 }
             } else {
-                LOG(WARNING) << "[OFFLOAD-NOTFOUND] key not found in master, "
-                             << "offloading_task orphaned, key="
-                             << object_id.user_key
-                             << " tenant=" << object_id.tenant_id;
+                // Master has no metadata for this key (e.g., after master
+                // restart or DelAll). Do NOT create a ghost metadata with only
+                // a LOCAL_DISK replica — it would block future PutStart with
+                // OBJECT_ALREADY_EXISTS. The SSD data is not lost; it will be
+                // rediscovered via OFFLOAD-SKIP when the client re-puts the
+                // same key.
+                LOG(INFO) << "[OFFLOAD-RECOVERY] key not in master, SSD data "
+                          << "will be rediscovered on re-put, key="
+                          << object_id.user_key
+                          << " tenant=" << object_id.tenant_id;
             }
+        }
+
+        // Add LOCAL_DISK replica only if metadata already existed.
+        // Creating metadata from scratch here produces ghost entries that
+        // block subsequent PutStart (OBJECT_ALREADY_EXISTS).
+        if (!metadata_existed) {
+            continue;
         }
 
         // Add LOCAL_DISK replica.
