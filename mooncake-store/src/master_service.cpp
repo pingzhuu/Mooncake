@@ -4245,7 +4245,16 @@ auto MasterService::NotifyOffloadSuccess(
                         source->dec_refcnt();
                     }
                     tenant_state.offloading_tasks.erase(task_it);
+                } else {
+                    LOG(WARNING) << "[OFFLOAD-NOTASK] key exists but no "
+                                 << "offloading_task, key=" << object_id.user_key
+                                 << " tenant=" << object_id.tenant_id;
                 }
+            } else {
+                LOG(WARNING) << "[OFFLOAD-NOTFOUND] key not found in master, "
+                             << "offloading_task orphaned, key="
+                             << object_id.user_key
+                             << " tenant=" << object_id.tenant_id;
             }
         }
 
@@ -4278,6 +4287,9 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     const ObjectIdentity& object_id, Replica& replica) {
     const auto& segment_names = replica.get_segment_names();
     if (segment_names.empty()) {
+        LOG(WARNING) << "[PUSH-EMPTY] segment_names empty for key="
+                     << object_id.user_key
+                     << " tenant=" << object_id.tenant_id;
         return {};
     }
     for (const auto& segment_name_it : segment_names) {
@@ -4931,7 +4943,8 @@ void MasterService::DiscardExpiredProcessingReplicas(
             expired_sum_age_ms += age_ms;
             if (age_ms > expired_max_age_ms) expired_max_age_ms = age_ms;
             auto metadata_it = tenant_state.metadata.find(task_it->first);
-            if (metadata_it != tenant_state.metadata.end()) {
+            bool metadata_exists = (metadata_it != tenant_state.metadata.end());
+            if (metadata_exists) {
                 auto source = metadata_it->second.GetReplicaByID(
                     task_it->second.source_id);
                 if (source != nullptr) {
@@ -4940,6 +4953,12 @@ void MasterService::DiscardExpiredProcessingReplicas(
             }
             VLOG(1) << "Offloading task expired for key: "
                     << task_it->first;
+            if (expired_count == 0) {
+                LOG(WARNING) << "[EXPIRE-DETAIL] first expired key="
+                             << task_it->first
+                             << " age_ms=" << age_ms
+                             << " metadata_exists=" << metadata_exists;
+            }
             task_it = tenant_state.offloading_tasks.erase(task_it);
             expired_count++;
         }
@@ -6045,6 +6064,21 @@ bool MasterService::TryRestoreStateFromSnapshot(
                                     ReplicaStatus::COMPLETE) ||
                                 (it->second.IsLeaseExpired(cleanup_now) &&
                                  !it->second.IsSoftPinned(cleanup_now))) {
+                                if (tenant_state.offloading_tasks.count(
+                                        it->first) > 0) {
+                                    LOG(WARNING)
+                                        << "[CLEANUP-ORPHAN] erasing metadata "
+                                        << "for key with active offloading_task, "
+                                        << "key=" << it->first
+                                        << " tenant=" << tenant_it->first
+                                        << " has_diff_complete="
+                                        << it->second.HasDiffRepStatus(
+                                               ReplicaStatus::COMPLETE).has_value()
+                                        << " lease_expired="
+                                        << it->second.IsLeaseExpired(cleanup_now)
+                                        << " soft_pinned="
+                                        << it->second.IsSoftPinned(cleanup_now);
+                                }
                                 VLOG(1) << "clear metadata key=" << it->first;
                                 it = EraseMetadata(tenant_state, it,
                                                    tenant_it->first);
