@@ -2469,7 +2469,17 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                     it = tenant_state.metadata.end();
                 } else {
                     auto& metadata = it->second;
-                    if (metadata.HasReplica(&Replica::fn_is_completed) ||
+                    // Only block PutStart if a completed MEMORY replica
+                    // exists (data in DRAM). A LOCAL_DISK-only metadata
+                    // (e.g., from ScanMeta recovery after store restart)
+                    // should not block a new PutStart — the new MEMORY
+                    // replica coexists with the LOCAL_DISK replica, and
+                    // BatchEvict will skip re-offloading since
+                    // has_local_disk_replica returns true.
+                    if (metadata.HasReplica([](const Replica& r) {
+                            return r.is_memory_replica() &&
+                                   r.is_completed();
+                        }) ||
                         metadata.put_start_time +
                                 put_start_discard_timeout_sec_ >=
                             now) {
@@ -4247,11 +4257,9 @@ auto MasterService::NotifyOffloadSuccess(
         const auto object_id = MakeObjectIdentity(task.key, task.tenant_id);
 
         // Release refcnt and clear offloading task.
-        bool metadata_existed = false;
         {
             MetadataAccessorRW accessor(this, object_id);
             if (accessor.Exists()) {
-                metadata_existed = true;
                 auto& obj_metadata = accessor.Get();
                 auto& tenant_state = accessor.GetTenantState();
                 auto task_it =
@@ -4269,34 +4277,28 @@ auto MasterService::NotifyOffloadSuccess(
                         source->dec_refcnt();
                     }
                     tenant_state.offloading_tasks.erase(task_it);
-                } else {
-                    // key exists with no offloading task. This happens during
-                    // ScanMeta recovery: store-server reports a key that was
-                    // already offloaded in a previous session. AddReplica below
-                    // will update/replace the LOCAL_DISK replica.
                 }
             } else {
                 // Master has no metadata for this key (e.g., after master
-                // restart or DelAll). Do NOT create a ghost metadata with only
-                // a LOCAL_DISK replica — it would block future PutStart with
-                // OBJECT_ALREADY_EXISTS. The SSD data is not lost; it will be
-                // rediscovered via OFFLOAD-SKIP when the client re-puts the
-                // same key.
-                LOG(INFO) << "[OFFLOAD-RECOVERY] key not in master, SSD data "
-                          << "will be rediscovered on re-put, key="
+                // restart or DelAll). AddReplica below will create metadata
+                // with a LOCAL_DISK replica so the SSD data is immediately
+                // available for cache hits. PutStart on the same key is
+                // now safe because Fix I changed the OBJECT_ALREADY_EXISTS
+                // check to only consider completed MEMORY replicas, not
+                // LOCAL_DISK.
+                LOG(INFO) << "[OFFLOAD-REGISTER] key not in master, "
+                          << "registering LOCAL_DISK replica from SSD, key="
                           << object_id.user_key
                           << " tenant=" << object_id.tenant_id;
             }
         }
 
-        // Add LOCAL_DISK replica only if metadata already existed.
-        // Creating metadata from scratch here produces ghost entries that
-        // block subsequent PutStart (OBJECT_ALREADY_EXISTS).
-        if (!metadata_existed) {
-            continue;
-        }
-
-        // Add LOCAL_DISK replica.
+        // Add LOCAL_DISK replica. When metadata doesn't exist AddReplica
+        // creates it (with only a LOCAL_DISK replica). This is intentional:
+        // it makes SSD data immediately available for cache hits after store
+        // restart. PutStart on the same key succeeds because Fix I changed
+        // the OBJECT_ALREADY_EXISTS check to only block on completed MEMORY
+        // replicas, not LOCAL_DISK-only metadata.
         Replica replica(client_id, metadata.data_size,
                         metadata.transport_endpoint, ReplicaStatus::COMPLETE);
         auto res = AddReplica(client_id, object_id.user_key,
