@@ -117,11 +117,11 @@ struct MasterConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     // Max promotion tasks PromotionObjectHeartbeat returns to a single
-    // client per call. Each task is a synchronous SSD-read + RDMA-write
-    // on the client; serializing them avoids blocking past the client-
-    // liveness window. Default 1 is conservative; small-object or RDMA-
-    // rich clusters may safely raise it.
-    uint32_t promotion_max_per_heartbeat = 1;
+    // client per call. After PR#2529 promotion runs on an independent
+    // worker thread, so raising this no longer blocks the heartbeat path.
+    // Default 64 matches the drain batch size; small-object or RDMA-poor
+    // clusters may lower it.
+    uint32_t promotion_max_per_heartbeat = 64;
 };
 
 class MasterServiceSupervisorConfig {
@@ -198,7 +198,7 @@ class MasterServiceSupervisorConfig {
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
-    uint32_t promotion_max_per_heartbeat = 1;
+    uint32_t promotion_max_per_heartbeat = 64;
 
     // Pod identity for K8s label-based routing
     std::string pod_name;
@@ -380,7 +380,7 @@ class WrappedMasterServiceConfig {
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
-    uint32_t promotion_max_per_heartbeat = 1;
+    uint32_t promotion_max_per_heartbeat = 64;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -949,7 +949,7 @@ class MasterServiceConfig {
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
-    uint32_t promotion_max_per_heartbeat = 1;
+    uint32_t promotion_max_per_heartbeat = 64;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;

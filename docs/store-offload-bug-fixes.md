@@ -198,16 +198,43 @@ store-nvme 部署（.15 master + 4 store-server, .18 4 store-server, 8× NVMe SS
 
 ## 关键配置参数
 
+### store-server 端
+
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `put_start_release_timeout_sec` | 600 | offload task TTL，测试时改为 120 |
 | `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` | 10 | store-server heartbeat 间隔，测试时改为 5 |
 | `MOONCAKE_OFFLOAD_WRITE_THREADS` | 4 | parallel WriteBucket 线程数 |
 | `MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT` | 1000 | 每 bucket 最大 key 数 |
 | `MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES` | 2GB | 每 bucket 最大字节数 |
+| `MOONCAKE_OFFLOAD_PROMOTION_WORKER_THREADS` | 1 | promotion worker 线程数，**必须调到 4** |
+| `MOONCAKE_OFFLOAD_PROMOTION_DRAIN_BATCH_SIZE` | 64 | promotion drain batch 大小 |
+| `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` | 1.25GB | batch-get SSD buffer，并发会 BUFFER_OVERFLOW，调到 20GB |
+
+### master 端
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `put_start_release_timeout_sec` | 600 | offload task TTL，测试时改为 120 |
 | `eviction_high_watermark_ratio` | 0.7 | DRAM 使用率触发 BatchEvict |
 | `eviction_ratio` | 0.2 | BatchEvict 目标：DRAM 使用率降到 20% |
+| `promotion_max_per_heartbeat` | 1 | 每心跳准入门数，**必须调到 64**（默认只 2/s，promotion 跟不上 70/s 需求 → 大量 expired） |
+| `promotion_admission_threshold` | 2 | CountMinSketch 频率阈值（第二次访问才入队） |
 | `kOffloadCapRatio` | 0.5 | offload cap = offloading_queue_limit_ × 0.5 |
+
+### promotion 调优结论
+
+PR#2529 把 promotion 从 heartbeat 同步路径剥离到独立 worker 线程后，原默认参数仍然保守，导致 promotion 完成率仅 45%（大量 expired）：`promotion_max_per_heartbeat=1` → 2 task/s 准入，压测需求 70/s。
+
+已将以下默认值直接改入源码（无需额外 env 配置）：
+
+| 参数 | 旧默认 | 新默认 | 文件 |
+|------|--------|--------|------|
+| `promotion_max_per_heartbeat` | 1 | 64 | `master_config.h`（4 处 config class） |
+| `promotion_worker_threads` | 1 | 4 | `storage_backend.h` |
+
+调优后 promotion expired 从 25259 降到 0。`PROMOTION_DRAIN_BATCH_SIZE` 默认已是 64，无需改。
+
+> 三个参数只有 `DRAIN_BATCH_SIZE` 保留默认即可，另外两个已通过源码修改保证开箱可用。
 
 ## 测试脚本
 
