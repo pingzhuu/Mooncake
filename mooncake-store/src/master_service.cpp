@@ -2620,18 +2620,27 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
 
     if (enable_offload_ && !offload_on_evict_) {
         auto& tenant_state = accessor.GetTenantState();
+        bool queued = false;
         metadata.VisitReplicas(
             [](const Replica& replica) {
                 return replica.is_completed() && replica.is_memory_replica();
             },
-            [this, &object_id, &tenant_state](Replica& replica) {
+            [this, &object_id, &tenant_state, &queued](Replica& replica) {
+                if (queued) return;  // only pin one replica per key
                 auto result = PushOffloadingQueue(object_id, replica);
                 if (result) {
                     replica.inc_refcnt();
-                    tenant_state.offloading_tasks.emplace(
+                    auto [it, inserted] = tenant_state.offloading_tasks.emplace(
                         object_id.user_key,
                         OffloadingTask{replica.id(),
                                        std::chrono::system_clock::now()});
+                    if (inserted) {
+                        queued = true;
+                    } else {
+                        // Another replica was already pinned for this key.
+                        // Undo the pin to avoid a refcnt leak.
+                        replica.dec_refcnt();
+                    }
                 }
             });
     }
@@ -6320,6 +6329,13 @@ MasterService::EvictTenantMemoryForQuota(const std::string& tenant_id,
                 return evict_replicas(metadata, deferred_replicas);
             }
 
+            // Guard against re-pinning a replica when an offloading task is
+            // already in flight for this key (see comment in BatchEvict's
+            // try_evict_or_offload for details).
+            if (tenant_state.offloading_tasks.count(key) > 0) {
+                return uint64_t{0};
+            }
+
             bool queued = false;
             metadata.VisitReplicas(
                 is_evictable_memory_replica,
@@ -6332,9 +6348,13 @@ MasterService::EvictTenantMemoryForQuota(const std::string& tenant_id,
                         MakeObjectIdentity(key, normalized_tenant), replica);
                     if (result) {
                         replica.inc_refcnt();
-                        tenant_state.offloading_tasks.emplace(
+                        auto [it, inserted] = tenant_state.offloading_tasks.emplace(
                             key, OffloadingTask{replica.id(), now});
-                        queued = true;
+                        if (inserted) {
+                            queued = true;
+                        } else {
+                            replica.dec_refcnt();
+                        }
                     }
                 });
 
@@ -6573,6 +6593,18 @@ void MasterService::BatchEvict(double evict_ratio_target,
             return std::pair<uint64_t, bool>{0, false};
         }
 
+        // If an offloading task is already in flight for this key (from a
+        // previous BatchEvict cycle where a replica was pinned but the
+        // store-server hasn't completed the offload yet), do NOT pin another
+        // replica. The pinned replica from the first cycle has refcnt=1 and
+        // is not evictable; this cycle should skip the key entirely.
+        // Without this guard, a second replica could be pinned (inc_refcnt)
+        // while the emplace into offloading_tasks silently fails (key already
+        // present), causing a permanent refcnt + quota leak.
+        if (tenant_state.offloading_tasks.count(key) > 0) {
+            return std::pair<uint64_t, bool>{0, false};
+        }
+
         // Queue one MEMORY replica for offload; others will be evicted below.
         bool queued = false;
         metadata.VisitReplicas(
@@ -6587,9 +6619,15 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     MakeObjectIdentity(key, tenant_id), replica);
                 if (result) {
                     replica.inc_refcnt();
-                    tenant_state.offloading_tasks.emplace(
+                    auto [it, inserted] = tenant_state.offloading_tasks.emplace(
                         key, OffloadingTask{replica.id(), now});
-                    queued = true;
+                    if (inserted) {
+                        queued = true;
+                    } else {
+                        // Race: another cycle already pinned a replica for
+                        // this key. Undo the pin to avoid a refcnt leak.
+                        replica.dec_refcnt();
+                    }
                 }
             });
 
