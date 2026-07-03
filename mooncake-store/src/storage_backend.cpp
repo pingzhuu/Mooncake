@@ -1376,6 +1376,8 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
                              .time_since_epoch()
                              .count();
         bucket->last_access_ns_.store(now_ns, std::memory_order_relaxed);
+        LOG(INFO) << "[LRU-FIX] BatchOffload commit: bucket_id=" << bucket_id
+                  << " lru_ts=" << now_ns << " keys=" << bucket->keys.size();
         buckets_.emplace(bucket_id, std::move(bucket));
         lru_index_.emplace(now_ns, bucket_id);
     }
@@ -2218,10 +2220,15 @@ BucketStorageBackend::SelectEvictionCandidate() {
                 if (actual_ts == ts) {
                     // Correct entry: remove from index (bucket is about to be
                     // evicted) and return.
+                    LOG(INFO) << "[LRU-BUG] EvictCandidate: bucket_id=" << id
+                              << " ts=" << ts << " (matches actual)";
                     lru_index_.erase(top_it);
                     return bucket_it;
                 }
                 // Stale: repair and retry to find the true minimum.
+                LOG(INFO) << "[LRU-BUG] EvictCandidate: bucket_id=" << id
+                          << " lru_index_ts=" << ts
+                          << " actual_ts=" << actual_ts << " (stale, repairing)";
                 lru_index_.erase(top_it);
                 lru_index_.emplace(actual_ts, id);
             }
