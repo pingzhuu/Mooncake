@@ -1370,8 +1370,14 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
                            << bucket->keys[i] << ", bucket_id=" << bucket_id;
             }
         }
+        // Set LRU timestamp to current time so newly written buckets
+        // are not treated as least-recently-used and evicted immediately.
+        int64_t now_ns = std::chrono::steady_clock::now()
+                             .time_since_epoch()
+                             .count();
+        bucket->last_access_ns_.store(now_ns, std::memory_order_relaxed);
         buckets_.emplace(bucket_id, std::move(bucket));
-        lru_index_.emplace(0LL, bucket_id);
+        lru_index_.emplace(now_ns, bucket_id);
     }
 
     return bucket_id;
