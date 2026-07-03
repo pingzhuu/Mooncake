@@ -1370,8 +1370,17 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
                            << bucket->keys[i] << ", bucket_id=" << bucket_id;
             }
         }
+        // Set LRU timestamp to current time. With the upstream default of 0,
+        // newly written buckets appear as 'least recently used' and are the
+        // first candidates selected by SelectEvictionCandidate once the SSD
+        // fills up — fresh cache data is evicted before it is ever read,
+        // collapsing the hit rate from ~80% to ~27%.
+        int64_t now_ns = std::chrono::steady_clock::now()
+                             .time_since_epoch()
+                             .count();
+        bucket->last_access_ns_.store(now_ns, std::memory_order_relaxed);
         buckets_.emplace(bucket_id, std::move(bucket));
-        lru_index_.emplace(0LL, bucket_id);
+        lru_index_.emplace(now_ns, bucket_id);
     }
 
     return bucket_id;
@@ -1914,13 +1923,18 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
         for (int64_t i = static_cast<int64_t>(bucket_keys.size());
              i < bucket_backend_config_.bucket_keys_limit; ++i) {
             if (it == offloading_objects.cend()) {
-                for (const auto& bucket_object : bucket_objects) {
-                    ungrouped_offloading_objects.emplace(bucket_object.first,
-                                                         bucket_object.second);
+                if (!bucket_keys.empty()) {
+                    auto bucket_keys_count =
+                        static_cast<int64_t>(bucket_keys.size());
+                    residue_count -= bucket_keys_count;
+                    buckets_keys.push_back(std::move(bucket_keys));
+                    VLOG(1) << "[OFFLOAD-PARTIAL] flushed partial bucket at "
+                               "input end: keys="
+                            << bucket_keys_count
+                            << " data_size=" << bucket_data_size
+                            << " total=" << total_count
+                            << " residue=" << residue_count;
                 }
-                VLOG(1) << "Add offloading objects to ungrouped pool. "
-                        << "Total ungrouped count: "
-                        << ungrouped_offloading_objects.size();
                 return {};
             }
 
@@ -2031,33 +2045,25 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         size_t total_size = static_cast<size_t>(bucket_metadata->data_size);
         size_t aligned_size = align_up(total_size, kDirectIOAlignment);
 
-        // Allocate aligned buffer if needed
+        // Allocate a per-call aligned buffer. The shared member
+        // aligned_io_buffer_ is NOT safe for concurrent WriteBucket calls
+        // (parallel WriteBucket dispatches multiple buckets simultaneously
+        // via worker threads); using it here would cause data corruption.
         void* write_buffer = nullptr;
-        std::unique_ptr<void, void (*)(void*)> temp_buffer{nullptr,
-                                                           [](void*) {}};
+        std::unique_ptr<void, void (*)(void*)> temp_buffer{
+            nullptr, [](void*) {}};
 
-        if (aligned_size <= kAlignedBufferSize && aligned_io_buffer_) {
-            // Use the pre-allocated buffer
-            write_buffer = aligned_io_buffer_.get();
-        } else {
-            // Allocate a temporary larger buffer
-            void* buf = nullptr;
-            int ret = posix_memalign(&buf, kDirectIOAlignment, aligned_size);
-            if (ret != 0) {
-                LOG(ERROR)
-                    << "Failed to allocate aligned buffer for WriteBucket: "
-                    << strerror(ret);
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-            }
-            temp_buffer.reset(buf);
-            temp_buffer = std::unique_ptr<void, void (*)(void*)>(
-                buf, [](void* p) { free(p); });
-            write_buffer = buf;
-            LOG(WARNING) << "WriteBucket: bucket_id=" << bucket_id
-                         << " requires " << aligned_size
-                         << " bytes, exceeds buffer size " << kAlignedBufferSize
-                         << ", using temporary allocation";
+        void* buf = nullptr;
+        int ret = posix_memalign(&buf, kDirectIOAlignment, aligned_size);
+        if (ret != 0) {
+            LOG(ERROR)
+                << "Failed to allocate aligned buffer for WriteBucket: "
+                << strerror(ret);
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
+        temp_buffer = std::unique_ptr<void, void (*)(void*)>(
+            buf, [](void* p) { free(p); });
+        write_buffer = buf;
 
         // Aggregate all iovs data into the aligned buffer
         char* dst = static_cast<char*>(write_buffer);

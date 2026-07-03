@@ -226,6 +226,25 @@ struct FileStorageConfig {
     uint32_t client_buffer_gc_interval_seconds = 1;
     uint64_t client_buffer_gc_ttl_ms = 5000;
 
+    // Background worker settings for L2->L1 promotion-on-hit execution.
+    // Set promotion_worker_threads to 0 to fall back to the synchronous
+    // (inline-in-heartbeat) execution path used before PR #2529.
+    // 4 matches production load where each heartbeat pulls 64 tasks and each
+    // task does a ~1-2 ms SSD read + RDMA write; 4 workers drain 64 tasks in
+    // ~16 ms, comfortably inside one heartbeat tick.
+    uint32_t promotion_worker_threads = 4;
+
+    // Parallel WriteBucket thread pool size for BatchOffload. Each heartbeat
+    // tick may dispatch many independent buckets; writing them in parallel
+    // raises single-NVMe write throughput from ~1.6 GB/s (serial) to ~4.7 GB/s
+    // (4 threads) so the SSD pipeline does not gate cache fill rate. 0 keeps
+    // the legacy serial loop.
+    uint32_t offload_write_threads = 4;
+    // Soft local backlog cap. 0 = unbounded.
+    uint32_t promotion_queue_capacity = 1024;
+    // Per-worker drain batch size.
+    uint32_t promotion_drain_batch_size = 64;
+
     // Use io_uring for file I/O instead of POSIX pread/pwrite
     bool use_uring = false;
 

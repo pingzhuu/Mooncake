@@ -1736,6 +1736,15 @@ MasterService::EraseMetadata(
     // becomes an orphan that only expires after 600s.
     auto offload_it = tenant_state.offloading_tasks.find(key);
     if (offload_it != tenant_state.offloading_tasks.end()) {
+        // BatchEvict is deleting metadata while the store worker still has an
+        // in-flight offload for this key. Without this cleanup the task would
+        // be an orphan that only expires after put_start_release_timeout_sec.
+        LOG(WARNING)
+            << "[CLEANUP-ORPHAN] erasing metadata for key=" << key
+            << " tenant=" << tenant_id
+            << " while offloading_task is still registered (source_id="
+            << offload_it->second.source_id
+            << "); dec_refcnt applied, offloading_task erased";
         auto source = metadata.GetReplicaByID(offload_it->second.source_id);
         if (source != nullptr) {
             source->dec_refcnt();
@@ -2998,7 +3007,19 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                     it = tenant_state.metadata.end();
                 } else {
                     auto& metadata = it->second;
-                    if (metadata.HasReplica(&Replica::fn_is_completed) ||
+                    // Block PutStart only when a completed MEMORY replica is
+                    // present. A LOCAL_DISK-only metadata (e.g. left over after
+                    // a store-server restart + ScanMeta recovery) must not
+                    // block writes — the LOCAL_DISK replica is there to serve
+                    // cache reads, not to gate new PutStart calls. Blocking on
+                    // any completed replica type (the previous behavior) caused
+                    // OBJECT_ALREADY_EXISTS for every key whose LOCAL_DISK
+                    // replica was re-registered after restart.
+                    bool has_completed_memory = metadata.HasReplica(
+                        [](const Replica& r) {
+                            return r.is_memory_replica() && r.is_completed();
+                        });
+                    if (has_completed_memory ||
                         metadata.put_start_time +
                                 put_start_discard_timeout_sec_ >=
                             now) {
@@ -3139,24 +3160,43 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
 
     if (enable_offload_ && !offload_on_evict_) {
         auto& tenant_state = accessor.GetTenantState();
-        bool task_created = false;
-        metadata.VisitReplicas(
-            [](const Replica& replica) {
-                return replica.is_completed() && replica.is_memory_replica();
-            },
-            [this, &object_id, &tenant_state, &task_created](Replica& replica) {
-                auto result = PushOffloadingQueue(object_id, replica);
-                if (result) {
-                    if (!task_created) {
+        // Skip if an offloading task is already in flight for this key —
+        // emplace would silently fail, leaving the inc_refcnt below as a
+        // permanent leak. With replica_num>1, the visitor would keep iterating
+        // after the first emplace, double-pinning the second replica.
+        if (tenant_state.offloading_tasks.count(object_id.user_key) == 0) {
+            bool task_created = false;
+            metadata.VisitReplicas(
+                [](const Replica& replica) {
+                    return replica.is_completed() && replica.is_memory_replica();
+                },
+                [this, &object_id, &tenant_state,
+                 &task_created](Replica& replica) {
+                    if (task_created) return;  // only pin one replica per key
+                    auto result = PushOffloadingQueue(object_id, replica);
+                    if (result) {
                         replica.inc_refcnt();
-                        tenant_state.offloading_tasks.emplace(
-                            object_id.user_key,
-                            OffloadingTask{replica.id(),
-                                           std::chrono::system_clock::now()});
-                        task_created = true;
+                        auto [it, inserted] =
+                            tenant_state.offloading_tasks.emplace(
+                                object_id.user_key,
+                                OffloadingTask{
+                                    replica.id(),
+                                    std::chrono::system_clock::now()});
+                        if (!inserted) {
+                            // Race: another path already queued this key.
+                            // Roll back the refcnt so it doesn't leak.
+                            replica.dec_refcnt();
+                            LOG(WARNING)
+                                << "[PUTEND-OFFLOAD-EMPLACE-FAIL] key="
+                                << object_id.user_key
+                                << " already has offloading_task; rolled "
+                                   "back refcnt";
+                        } else {
+                            task_created = true;
+                        }
                     }
-                }
-            });
+                });
+        }
     }
 
     // If the object is completed, remove it from the processing set.
@@ -3203,6 +3243,29 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         LOG(ERROR) << "Invalid replica type: " << replica.type()
                    << ". Expected ReplicaType::LOCAL_DISK.";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Erase stale LOCAL_DISK replicas from a previous (restarted) store-server
+    // incarnation. Without this, a stale transport_endpoint lingers in metadata
+    // after the store-server restarts with a new client_id; the visitor below
+    // requires matching client_id, so the new replica would be silently dropped
+    // and reads would follow the dead endpoint (INVALID_KEY / RDMA errors).
+    bool had_completed_disk = metadata.HasReplica([](const Replica& r) {
+        return r.is_local_disk_replica() && r.is_completed();
+    });
+    size_t stale_erased = EraseReplicasWithCacheTotalAccounting(
+        metadata,
+        [&client_id](const Replica& rep) {
+            return rep.is_local_disk_replica() &&
+                   rep.get_descriptor().get_local_disk_descriptor().client_id !=
+                       client_id;
+        });
+    if (stale_erased > 0) {
+        auto& shard = accessor.GetShard();
+        shard.OnDiskReplicaRemoved(had_completed_disk, metadata);
+        LOG(INFO) << "[ADDREPLICA-STALE] erased " << stale_erased
+                  << " stale LOCAL_DISK replica(s) for key=" << key
+                  << " tenant=" << normalized_tenant;
     }
 
     if (!metadata.HasReplica(&Replica::fn_is_local_disk_replica)) {
@@ -4927,6 +4990,23 @@ auto MasterService::NotifyOffloadSuccess(
                                << ". Expected ReplicaType::LOCAL_DISK.";
                     return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                 }
+                if (task_it == tenant_state.offloading_tasks.end()) {
+                    // Worker reports offload success for a key the master does
+                    // not remember queuing. Either the offloading_task already
+                    // expired (put_start_release_timeout_sec) or the metadata
+                    // was erased by BatchEvict's cleanup phase. Either way the
+                    // caller has done the work; we accept the LOCAL_DISK
+                    // replica via AddReplica below but log the mismatch so
+                    // orphan-task sources are visible.
+                    LOG(INFO)
+                        << "[OFFLOAD-NOTASK] NotifyOffloadSuccess received a "
+                           "complete for key="
+                        << request_object_id.user_key
+                        << " tenant=" << request_object_id.tenant_id
+                        << " but no offloading_task is registered (already "
+                           "expired or cleaned up); will add LOCAL_DISK "
+                           "replica via AddReplica";
+                }
 
                 // Existing orphan objects can only bypass tenant registration
                 // for a master-admitted offload completion. Without this task
@@ -5013,6 +5093,14 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     const ObjectIdentity& object_id, Replica& replica) {
     const auto& segment_names = replica.get_segment_names();
     if (segment_names.empty()) {
+        // Replica has no transport segments — nothing to offload. This is
+        // unusual for a MEMORY replica that triggered BatchEvict; log it so
+        // silent no-ops show up in diagnostics instead of mysteriously
+        // skipping the offload path.
+        LOG(WARNING) << "[PUSH-EMPTY] PushOffloadingQueue called for key="
+                     << object_id.user_key
+                     << " tenant=" << object_id.tenant_id
+                     << " but replica has no segment_names; offload skipped";
         return {};
     }
     for (const auto& segment_name_it : segment_names) {
@@ -6891,22 +6979,36 @@ MasterService::EvictTenantMemoryForQuota(const std::string& tenant_id,
             }
 
             bool queued = false;
-            metadata.VisitReplicas(
-                is_evictable_memory_replica,
-                [this, &key, &normalized_tenant, &tenant_state, &queued,
-                 &now](Replica& replica) {
-                    if (queued) {
-                        return;
-                    }
-                    auto result = PushOffloadingQueue(
-                        MakeObjectIdentity(key, normalized_tenant), replica);
-                    if (result) {
-                        replica.inc_refcnt();
-                        tenant_state.offloading_tasks.emplace(
-                            key, OffloadingTask{replica.id(), now});
-                        queued = true;
-                    }
-                });
+            // Skip if an offloading task is already in flight for this key to
+            // avoid the cross-cycle re-pin refcnt leak (see Bug J part 1).
+            if (tenant_state.offloading_tasks.count(key) == 0) {
+                metadata.VisitReplicas(
+                    is_evictable_memory_replica,
+                    [this, &key, &normalized_tenant, &tenant_state, &queued,
+                     &now](Replica& replica) {
+                        if (queued) return;
+                        auto result = PushOffloadingQueue(
+                            MakeObjectIdentity(key, normalized_tenant),
+                            replica);
+                        if (result) {
+                            replica.inc_refcnt();
+                            auto [it, inserted] =
+                                tenant_state.offloading_tasks.emplace(
+                                    key, OffloadingTask{replica.id(), now});
+                            if (!inserted) {
+                                replica.dec_refcnt();
+                                LOG(WARNING)
+                                    << "[TENANT-EVICT-OFFLOAD-EMPLACE-FAIL] "
+                                       "key="
+                                    << key
+                                    << " already has offloading_task; rolled "
+                                       "back refcnt";
+                            } else {
+                                queued = true;
+                            }
+                        }
+                    });
+            }
 
             if (queued) {
                 ++offload_queued_this_call;
@@ -6925,7 +7027,8 @@ MasterService::EvictTenantMemoryForQuota(const std::string& tenant_id,
         [&, this](const std::string& key, ObjectMetadata& metadata,
                   TenantState& tenant_state,
                   std::vector<std::vector<Replica>>& deferred_replicas,
-                  bool allow_soft_pinned) -> TenantQuotaEvictionResult {
+                  bool allow_soft_pinned,
+                  MetadataShardAccessorRW* shard_ptr) -> TenantQuotaEvictionResult {
         if (!metadata.IsGrouped()) {
             uint64_t freed = try_evict_or_offload(key, metadata, tenant_state,
                                                   deferred_replicas);
@@ -6972,7 +7075,8 @@ MasterService::EvictTenantMemoryForQuota(const std::string& tenant_id,
                 ++result.evicted_objects;
             }
             if (member_key != key && !member_metadata.IsValid()) {
-                EraseMetadata(tenant_state, member_it, normalized_tenant);
+                EraseMetadata(tenant_state, member_it, normalized_tenant,
+                              QuotaEraseMode::kFull, shard_ptr);
             }
         }
         return result;
@@ -7006,11 +7110,12 @@ MasterService::EvictTenantMemoryForQuota(const std::string& tenant_id,
 
                     auto evict_result = try_evict_group_or_object(
                         it->first, metadata, tenant_state, deferred_replicas,
-                        allow_soft_pinned);
+                        allow_soft_pinned, &shard);
                     total.freed_bytes += evict_result.freed_bytes;
                     total.evicted_objects += evict_result.evicted_objects;
                     if (!metadata.IsValid()) {
-                        it = EraseMetadata(tenant_state, it, normalized_tenant);
+                        it = EraseMetadata(tenant_state, it, normalized_tenant,
+                                           QuotaEraseMode::kFull, &shard);
                     } else {
                         ++it;
                     }
@@ -7134,24 +7239,40 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
 
         // Queue one MEMORY replica for offload; others will be evicted below.
+        // Skip if an offloading task is already in flight for this key —
+        // otherwise the emplace below silently fails and inc_refcnt leaks.
         bool queued = false;
-        metadata.VisitReplicas(
-            [](const Replica& r) {
-                return r.is_memory_replica() && r.is_completed() &&
-                       r.get_refcnt() == 0;
-            },
-            [this, &tenant_id, &key, &tenant_state, &queued,
-             &now](Replica& replica) {
-                if (queued) return;  // only need to pin one replica for offload
-                auto result = PushOffloadingQueue(
-                    MakeObjectIdentity(key, tenant_id), replica);
-                if (result) {
-                    replica.inc_refcnt();
-                    tenant_state.offloading_tasks.emplace(
-                        key, OffloadingTask{replica.id(), now});
-                    queued = true;
-                }
-            });
+        if (tenant_state.offloading_tasks.count(key) == 0) {
+            metadata.VisitReplicas(
+                [](const Replica& r) {
+                    return r.is_memory_replica() && r.is_completed() &&
+                           r.get_refcnt() == 0;
+                },
+                [this, &tenant_id, &key, &tenant_state, &queued,
+                 &now](Replica& replica) {
+                    if (queued) return;  // only pin one replica for offload
+                    auto result = PushOffloadingQueue(
+                        MakeObjectIdentity(key, tenant_id), replica);
+                    if (result) {
+                        replica.inc_refcnt();
+                        auto [it, inserted] =
+                            tenant_state.offloading_tasks.emplace(
+                                key, OffloadingTask{replica.id(), now});
+                        if (!inserted) {
+                            // Cross-cycle re-pin: another iteration already
+                            // queued this key. Roll back to avoid refcnt leak.
+                            replica.dec_refcnt();
+                            LOG(WARNING)
+                                << "[BATCHEVICT-OFFLOAD-EMPLACE-FAIL] key="
+                                << key
+                                << " already has offloading_task; rolled "
+                                   "back refcnt";
+                        } else {
+                            queued = true;
+                        }
+                    }
+                });
+        }
 
         if (queued) {
             offload_queued_this_cycle++;
